@@ -42,7 +42,7 @@
 #define DRIVER_ALIAS "SPI/I2C/GPIO: CH347/CH341"
 #define DRIVER_DESC \
 	"USB to SPI/I2C/GPIO controller driver for CH347/CH341, etc."
-#define VERSION_DESC "V1.6 On 2026.04"
+#define VERSION_DESC "V1.7 On 2026.06"
 
 /* Check for condition and return with or without err code if it fails */
 #define CHECK_PARAM_RET(cond, err) \
@@ -166,7 +166,8 @@
 #define GPIO_ENABLE BIT(7)
 #define GPIO_DIR_SET BIT(6)
 
-#define USB_CMD_BATCH_NR 16
+#define DEFAULT_TIMEOUT 1000
+#define CH34X_NW 4
 
 #ifndef USB_DEVICE_INTERFACE_NUMBER
 #define USB_DEVICE_INTERFACE_NUMBER(vend, prod, num)   \
@@ -252,14 +253,16 @@ typedef struct _stream_usbcfg {
 	u8 reserved[4]; /* reserved */
 } stream_hw_cfgs, *pstream_hw_cfgs;
 
-struct usb_cmd_buf {
-	struct list_head list;
-	struct urb *urb;
-	u32 ilen;
-	u8 *ibuf;
-};
-
 #pragma pack()
+
+struct ch34x_wb {
+	struct ch34x_device *instance;
+	unsigned char *buf;
+	dma_addr_t dmah;
+	int len;
+	int use;
+	struct urb *urb;
+};
 
 /* Device specific structure */
 struct ch34x_device {
@@ -277,14 +280,17 @@ struct ch34x_device {
 	u8 *bulkin_buf; /* usb bulk in buffer */
 	u8 *bulkout_buf; /* usb bulk out buffer */
 	u8 *intrin_buf; /* usb interrupt in buffer */
+	wait_queue_head_t wq_send; /* for usb write */
+	int writesize;
+	struct ch34x_wb wb[CH34X_NW];
+	int write_used; /* number of non-empty write buffers */
+	int transmitting;
+	spinlock_t write_lock;
 
 	struct usb_anchor
 		submitted; /* in case we need to retract our submissions */
 	int errors;
 	spinlock_t err_lock;
-
-	struct list_head usb_cmd_list_used;
-	struct list_head usb_cmd_list_free;
 
 	int windex;
 
