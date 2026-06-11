@@ -81,8 +81,6 @@ extern void ch34x_mphsi_gpio_remove(struct ch34x_device *ch34x_dev);
 extern int ch347_irq_check(struct ch34x_device *ch34x_dev, u8 irq);
 extern int ch34x_usb_transfer(struct ch34x_device *ch34x_dev, int out_len,
 			      int in_len);
-extern int ch34x_usb_transfer_i2c(struct ch34x_device *ch34x_dev,
-				  int out_len, int in_len);
 extern bool ch347_get_chipinfo(struct ch34x_device *ch34x_dev);
 extern bool ch347_func_switch(struct ch34x_device *ch34x_dev, int index);
 extern void ch34x_mphsi_i2c_remove(struct ch34x_device *ch34x_dev);
@@ -196,13 +194,73 @@ static void ch34x_cfg_remove(struct ch34x_device *ch34x_dev)
 	return;
 }
 
+static int ch34x_wb_alloc(struct ch34x_device *ch34x_dev)
+{
+	int i, wbn;
+	struct ch34x_wb *wb;
+
+	wbn = 0;
+	i = 0;
+	for (;;) {
+		wb = &ch34x_dev->wb[wbn];
+		if (!wb->use) {
+			wb->use = 1;
+			return wbn;
+		}
+		wbn = (wbn + 1) % CH34X_NW;
+		if (++i >= CH34X_NW)
+			return -1;
+	}
+}
+
+static int ch34x_wb_is_avail(struct ch34x_device *ch34x_dev)
+{
+	int i, n;
+	unsigned long flags;
+
+	n = CH34X_NW;
+	spin_lock_irqsave(&ch34x_dev->write_lock, flags);
+	for (i = 0; i < CH34X_NW; i++)
+		n -= ch34x_dev->wb[i].use;
+	spin_unlock_irqrestore(&ch34x_dev->write_lock, flags);
+
+	return n;
+}
+
+static void ch34x_write_done(struct ch34x_device *ch34x_dev,
+			     struct ch34x_wb *wb)
+{
+	wb->use = 0;
+	ch34x_dev->transmitting--;
+}
+
+static int ch34x_start_wb(struct ch34x_device *ch34x_dev,
+			  struct ch34x_wb *wb)
+{
+	int rc;
+
+	ch34x_dev->transmitting++;
+
+	wb->urb->transfer_buffer = wb->buf;
+	wb->urb->transfer_dma = wb->dmah;
+	wb->urb->transfer_buffer_length = wb->len;
+	wb->urb->dev = ch34x_dev->usb_dev;
+
+	rc = usb_submit_urb(wb->urb, GFP_ATOMIC);
+	if (rc < 0) {
+		DEV_ERR(CH34X_USBDEV,
+			"%s - usb_submit_urb(write bulk) failed: %d\n",
+			__func__, rc);
+		ch34x_write_done(ch34x_dev, wb);
+	}
+	return rc;
+}
+
 static void ch34x_write_bulk_callback(struct urb *urb)
 {
-	struct ch34x_device *ch34x_dev;
-	struct list_head *pos, *n;
-	struct usb_cmd_buf *pusb_cmd;
-
-	ch34x_dev = urb->context;
+	struct ch34x_wb *wb = urb->context;
+	struct ch34x_device *ch34x_dev = wb->instance;
+	unsigned long flags;
 
 	/* sync/async unlink faults aren't errors */
 	if (urb->status) {
@@ -217,99 +275,10 @@ static void ch34x_write_bulk_callback(struct urb *urb)
 		ch34x_dev->errors = urb->status;
 		spin_unlock(&ch34x_dev->err_lock);
 	}
-
-	if (list_empty(&ch34x_dev->usb_cmd_list_used))
-		return;
-
-	list_for_each_safe(pos, n, &ch34x_dev->usb_cmd_list_used) {
-		pusb_cmd = list_entry(pos, struct usb_cmd_buf, list);
-		if (pusb_cmd != NULL) {
-			if (pusb_cmd->urb == urb) {
-				list_del(pos);
-				list_add_tail(
-					&pusb_cmd->list,
-					&ch34x_dev->usb_cmd_list_free);
-			}
-		}
-	}
-}
-
-static void ch34x_batch_buffer_free(struct ch34x_device *ch34x_dev)
-{
-	struct usb_cmd_buf *pusb_cmd;
-	struct list_head *pos, *n;
-
-	list_for_each_safe(pos, n, &ch34x_dev->usb_cmd_list_used) {
-		pusb_cmd = list_entry(pos, struct usb_cmd_buf, list);
-		list_del(pos);
-		if (pusb_cmd != NULL) {
-			list_add_tail(&pusb_cmd->list,
-				      &ch34x_dev->usb_cmd_list_free);
-		}
-	}
-
-	list_for_each_safe(pos, n, &ch34x_dev->usb_cmd_list_free) {
-		pusb_cmd = list_entry(pos, struct usb_cmd_buf, list);
-		list_del(pos);
-		if (pusb_cmd != NULL) {
-			if (pusb_cmd->urb) {
-				if (pusb_cmd->ibuf)
-					usb_free_coherent(
-						ch34x_dev->usb_dev,
-						MAX_BUFFER_LENGTH * 2,
-						pusb_cmd->ibuf,
-						pusb_cmd->urb
-							->transfer_dma);
-				usb_free_urb(pusb_cmd->urb);
-			}
-			kfree(pusb_cmd);
-		}
-	}
-}
-
-static int ch34x_batch_buffer_alloc(struct ch34x_device *ch34x_dev)
-{
-	int i;
-	int retval;
-	struct usb_cmd_buf *pusb_cmd;
-
-	INIT_LIST_HEAD(&ch34x_dev->usb_cmd_list_used);
-	INIT_LIST_HEAD(&ch34x_dev->usb_cmd_list_free);
-
-	for (i = 0; i < USB_CMD_BATCH_NR; i++) {
-		pusb_cmd = (struct usb_cmd_buf *)kmalloc(
-			sizeof(struct usb_cmd_buf), GFP_KERNEL);
-		if (pusb_cmd == NULL) {
-			retval = -ENOMEM;
-			goto exit;
-		}
-		/* Create a urb, and a buffer for it, and copy the data to the urb */
-		pusb_cmd->urb = usb_alloc_urb(0, GFP_KERNEL);
-		if (!pusb_cmd->urb) {
-			retval = -ENOMEM;
-			goto exit;
-		}
-
-		pusb_cmd->ibuf = usb_alloc_coherent(
-			ch34x_dev->usb_dev, MAX_BUFFER_LENGTH * 2,
-			GFP_KERNEL, &pusb_cmd->urb->transfer_dma);
-		if (!pusb_cmd->ibuf) {
-			retval = -ENOMEM;
-			goto exit;
-		}
-
-		pusb_cmd->ilen = MAX_BUFFER_LENGTH * 2;
-
-		list_add_tail(&pusb_cmd->list,
-			      &ch34x_dev->usb_cmd_list_free);
-	}
-
-	return 0;
-
-exit:
-	ch34x_batch_buffer_free(ch34x_dev);
-
-	return retval;
+	spin_lock_irqsave(&ch34x_dev->write_lock, flags);
+	ch34x_write_done(ch34x_dev, wb);
+	wake_up_interruptible(&ch34x_dev->wq_send);
+	spin_unlock_irqrestore(&ch34x_dev->write_lock, flags);
 }
 
 int ch34x_usb_transfer(struct ch34x_device *ch34x_dev, int out_len,
@@ -319,47 +288,46 @@ int ch34x_usb_transfer(struct ch34x_device *ch34x_dev, int out_len,
 	int actual = 0;
 	int rlen;
 	int size;
-	struct usb_cmd_buf *pusb_cmd = NULL;
-
+	int wbn;
+	struct ch34x_wb *wb;
+	unsigned long flags;
+	int timeout;
+	bool i2cmode = false;
 	CHECK_PARAM_RET(ch34x_dev, -EINVAL);
 
 	if (out_len != 0) {
-		if (!list_empty(&ch34x_dev->usb_cmd_list_free)) {
-			pusb_cmd = list_entry(
-				ch34x_dev->usb_cmd_list_free.next,
-				struct usb_cmd_buf, list);
-			list_del(ch34x_dev->usb_cmd_list_free.next);
-			if (pusb_cmd != NULL) {
-				pusb_cmd->ilen = out_len;
-				memcpy(pusb_cmd->ibuf,
-				       ch34x_dev->bulkout_buf, out_len);
-				list_add_tail(
-					&pusb_cmd->list,
-					&ch34x_dev->usb_cmd_list_used);
-			} else {
-				retval = -ENOMEM;
-				goto error;
-			}
-		} else {
-			retval = -ENOMEM;
-			goto error;
+retry:
+		spin_lock_irqsave(&ch34x_dev->write_lock, flags);
+		wbn = ch34x_wb_alloc(ch34x_dev);
+		if (wbn < 0) {
+			spin_unlock_irqrestore(&ch34x_dev->write_lock,
+					       flags);
+			timeout = wait_event_interruptible_timeout(
+				ch34x_dev->wq_send,
+				ch34x_wb_is_avail(ch34x_dev),
+				msecs_to_jiffies(DEFAULT_TIMEOUT));
+			if (timeout <= 0) {
+		        wb->use = 0;
+				return -ETIMEDOUT;
+			} else
+				goto retry;
 		}
+		wb = &ch34x_dev->wb[wbn];
+		spin_unlock_irqrestore(&ch34x_dev->write_lock, flags);
 
-		/* Initialize the urb properly */
-		usb_fill_bulk_urb(
-			pusb_cmd->urb, ch34x_dev->usb_dev,
+		memcpy(wb->buf, ch34x_dev->bulkout_buf, out_len);
+		wb->len = out_len;
+
+		usb_anchor_urb(wb->urb, &ch34x_dev->submitted);
+		wb->urb->pipe =
 			usb_sndbulkpipe(ch34x_dev->usb_dev,
-					ch34x_dev->bulk_out_endpointAddr),
-			pusb_cmd->ibuf, pusb_cmd->ilen,
-			ch34x_write_bulk_callback, ch34x_dev);
-		pusb_cmd->urb->transfer_flags |= URB_NO_TRANSFER_DMA_MAP;
-		usb_anchor_urb(pusb_cmd->urb, &ch34x_dev->submitted);
-
-		/* Send the data out the bulk port */
-		retval = usb_submit_urb(pusb_cmd->urb, GFP_KERNEL);
-		if (retval) {
+					ch34x_dev->bulk_out_endpointAddr);
+		retval = ch34x_start_wb(ch34x_dev, wb);
+		if (retval)
 			goto error_unanchor;
-		}
+		if (ch34x_dev->bulkout_buf[0] == CH341_CMD_I2C_STREAM &&
+		    ch34x_dev->bulkout_buf[1] == CH341_CMD_I2C_STM_STA)
+			i2cmode = true;
 	}
 
 	if (in_len == 0) {
@@ -386,97 +354,16 @@ int ch34x_usb_transfer(struct ch34x_device *ch34x_dev, int out_len,
 			break;
 		}
 		actual += rlen;
+		if (i2cmode && actual == 1 && ch34x_dev->bulkin_buf[0] == 0x00)
+			break;
 	}
+
 
 exit:
 	return retval < 0 ? retval : actual;
-
 error_unanchor:
-	usb_unanchor_urb(pusb_cmd->urb);
-error:
-	return retval;
-}
-
-int ch34x_usb_transfer_i2c(struct ch34x_device *ch34x_dev, int out_len,
-			   int in_len)
-{
-	int retval;
-	int actual = 0;
-	int rlen;
-	int size;
-	struct usb_cmd_buf *pusb_cmd = NULL;
-
-	CHECK_PARAM_RET(ch34x_dev, -EINVAL);
-
-	if (out_len != 0) {
-		if (!list_empty(&ch34x_dev->usb_cmd_list_free)) {
-			pusb_cmd = list_entry(
-				ch34x_dev->usb_cmd_list_free.next,
-				struct usb_cmd_buf, list);
-			list_del(ch34x_dev->usb_cmd_list_free.next);
-			if (pusb_cmd != NULL) {
-				pusb_cmd->ilen = out_len;
-				memcpy(pusb_cmd->ibuf,
-				       ch34x_dev->bulkout_buf, out_len);
-				list_add_tail(
-					&pusb_cmd->list,
-					&ch34x_dev->usb_cmd_list_used);
-			} else {
-				retval = -ENOMEM;
-				goto error;
-			}
-		} else {
-			retval = -ENOMEM;
-			goto error;
-		}
-
-		/* Initialize the urb properly */
-		usb_fill_bulk_urb(
-			pusb_cmd->urb, ch34x_dev->usb_dev,
-			usb_sndbulkpipe(ch34x_dev->usb_dev,
-					ch34x_dev->bulk_out_endpointAddr),
-			pusb_cmd->ibuf, pusb_cmd->ilen,
-			ch34x_write_bulk_callback, ch34x_dev);
-		pusb_cmd->urb->transfer_flags |= URB_NO_TRANSFER_DMA_MAP;
-		usb_anchor_urb(pusb_cmd->urb, &ch34x_dev->submitted);
-
-		/* Send the data out the bulk port */
-		retval = usb_submit_urb(pusb_cmd->urb, GFP_KERNEL);
-		if (retval) {
-			goto error_unanchor;
-		}
-	}
-
-	if (in_len == 0) {
-		actual = out_len;
-		goto exit;
-	}
-
-	size = in_len;
-	memset(ch34x_dev->bulkin_buf, 0, MAX_BUFFER_LENGTH * 2);
-	while (actual < size) {
-		retval = usb_bulk_msg(
-			ch34x_dev->usb_dev,
-			usb_rcvbulkpipe(
-				ch34x_dev->usb_dev,
-				usb_endpoint_num(ch34x_dev->bulk_in)),
-			ch34x_dev->bulkin_buf + actual, size - actual,
-			&rlen, 2000);
-		if (retval) {
-			DEV_ERR(CH34X_USBDEV,
-				"%s - Failed in usb_bulk_msg, error %d\n",
-				__func__, retval);
-			goto exit;
-		}
-		actual += rlen;
-	}
-
-exit:
-	return retval < 0 ? retval : actual;
-
-error_unanchor:
-	usb_unanchor_urb(pusb_cmd->urb);
-error:
+    wb->use = 0;
+	usb_unanchor_urb(wb->urb);
 	return retval;
 }
 
@@ -618,15 +505,63 @@ static void ch34x_usb_complete_intr_urb(struct urb *urb)
 	}
 }
 
+static int ch34x_write_buffers_alloc(struct ch34x_device *ch34x_dev)
+{
+	int i;
+	struct ch34x_wb *wb;
+
+	for (wb = &ch34x_dev->wb[0], i = 0; i < CH34X_NW; i++, wb++) {
+		wb->buf = usb_alloc_coherent(ch34x_dev->usb_dev,
+					     ch34x_dev->writesize,
+					     GFP_KERNEL, &wb->dmah);
+		if (!wb->buf) {
+			while (i != 0) {
+				--i;
+				--wb;
+				usb_free_coherent(ch34x_dev->usb_dev,
+						  ch34x_dev->writesize,
+						  wb->buf, wb->dmah);
+			}
+			return -ENOMEM;
+		}
+	}
+	return 0;
+}
+
+static void ch34x_write_buffers_free(struct ch34x_device *ch34x_dev)
+{
+	int i;
+	struct ch34x_wb *wb;
+
+	for (wb = &ch34x_dev->wb[0], i = 0; i < CH34X_NW; i++, wb++) {
+		if (wb->buf)
+			usb_free_coherent(ch34x_dev->usb_dev,
+					  ch34x_dev->writesize, wb->buf,
+					  wb->dmah);
+	}
+}
+
 static void ch34x_usb_free_device(struct ch34x_device *ch34x_dev)
 {
-	CHECK_PARAM(ch34x_dev)
+	int i;
 
+	CHECK_PARAM(ch34x_dev);
 	if (ch34x_dev->intr_urb)
 		usb_free_urb(ch34x_dev->intr_urb);
+	if (ch34x_dev->bulkout_buf)
+		kfree(ch34x_dev->bulkout_buf);
+	if (ch34x_dev->bulkin_buf)
+		kfree(ch34x_dev->bulkin_buf);
+	if (ch34x_dev->intrin_buf)
+		kfree(ch34x_dev->intrin_buf);
 
-	usb_set_intfdata(ch34x_dev->intf, NULL);
+	for (i = 0; i < CH34X_NW; i++) {
+		if (ch34x_dev->wb[i].urb)
+			usb_free_urb(ch34x_dev->wb[i].urb);
+	}
 	usb_kill_anchored_urbs(&ch34x_dev->submitted);
+	ch34x_write_buffers_free(ch34x_dev);
+	usb_set_intfdata(ch34x_dev->intf, NULL);
 	usb_put_dev(ch34x_dev->usb_dev);
 	kfree(ch34x_dev);
 }
@@ -639,7 +574,7 @@ static int ch34x_usb_probe(struct usb_interface *intf,
 	struct usb_endpoint_descriptor *endpoint;
 	struct usb_host_interface *iface_desc;
 	struct ch34x_device *ch34x_dev;
-	int i;
+	int i, j;
 	int ret = 0;
 	int length = 0;
 
@@ -689,6 +624,27 @@ static int ch34x_usb_probe(struct usb_interface *intf,
 					"Could not allocate bulkout buffer");
 				goto error;
 			}
+			ch34x_dev->writesize = MAX_BUFFER_LENGTH * 2;
+
+			ret = ch34x_write_buffers_alloc(ch34x_dev);
+			if (ret)
+				goto error;
+
+			for (j = 0; j < CH34X_NW; j++) {
+				struct ch34x_wb *snd = &(ch34x_dev->wb[j]);
+
+				snd->urb = usb_alloc_urb(0, GFP_KERNEL);
+				if (snd->urb == NULL)
+					goto error;
+
+				usb_fill_bulk_urb(
+					snd->urb, ch34x_dev->usb_dev, 0,
+					NULL, ch34x_dev->writesize,
+					ch34x_write_bulk_callback, snd);
+				snd->urb->transfer_flags |=
+					URB_NO_TRANSFER_DMA_MAP;
+				snd->instance = ch34x_dev;
+			}
 		}
 
 		else if (usb_endpoint_xfer_int(endpoint)) {
@@ -702,10 +658,6 @@ static int ch34x_usb_probe(struct usb_interface *intf,
 			}
 		}
 	}
-
-	ret = ch34x_batch_buffer_alloc(ch34x_dev);
-	if (ret)
-		goto error;
 
 	if (id->idProduct == 0x5512) {
 		ch34x_dev->chiptype = CHIP_CH341;
@@ -725,6 +677,8 @@ static int ch34x_usb_probe(struct usb_interface *intf,
 	usb_set_intfdata(intf, ch34x_dev);
 	mutex_init(&ch34x_dev->io_mutex);
 	spin_lock_init(&ch34x_dev->err_lock);
+	spin_lock_init(&ch34x_dev->write_lock);
+	init_waitqueue_head(&ch34x_dev->wq_send);
 	init_usb_anchor(&ch34x_dev->submitted);
 
 	if (ch34x_dev->chiptype != CHIP_CH341) {
@@ -828,13 +782,6 @@ error1:
 	ida_simple_remove(&ch34x_devid_ida, ch34x_dev->id);
 #endif
 error:
-	ch34x_batch_buffer_free(ch34x_dev);
-	if (ch34x_dev->bulkin_buf)
-		kfree(ch34x_dev->bulkin_buf);
-	if (ch34x_dev->bulkout_buf)
-		kfree(ch34x_dev->bulkout_buf);
-	if (ch34x_dev->intrin_buf)
-		kfree(ch34x_dev->intrin_buf);
 	ch34x_usb_free_device(ch34x_dev);
 
 	return ret;
@@ -847,8 +794,11 @@ static void ch34x_draw_down(struct ch34x_device *ch34x_dev)
 	time = usb_wait_anchor_empty_timeout(&ch34x_dev->submitted, 1000);
 	if (!time)
 		usb_kill_anchored_urbs(&ch34x_dev->submitted);
+	if (ch34x_dev->intr_urb)
+		usb_free_urb(ch34x_dev->intr_urb);
 }
 
+#ifdef CONFIG_PM
 static int ch34x_usb_suspend(struct usb_interface *intf,
 			     pm_message_t message)
 {
@@ -864,6 +814,7 @@ static int ch34x_usb_resume(struct usb_interface *intf)
 {
 	return 0;
 }
+#endif
 
 static int ch34x_pre_reset(struct usb_interface *intf)
 {
@@ -891,7 +842,6 @@ static void ch34x_usb_disconnect(struct usb_interface *intf)
 
 	DEV_INFO(CH34X_USBDEV, "CH34X adapter now disconnected");
 
-	ch34x_batch_buffer_free(ch34x_dev);
 	ch34x_mphsi_i2c_remove(ch34x_dev);
 	ch34x_spi_remove(ch34x_dev);
 	ch34x_mphsi_spi_remove(ch34x_dev);
@@ -905,12 +855,6 @@ static void ch34x_usb_disconnect(struct usb_interface *intf)
 #else
 	ida_simple_remove(&ch34x_devid_ida, ch34x_dev->id);
 #endif
-	if (ch34x_dev->bulkin_buf)
-		kfree(ch34x_dev->bulkin_buf);
-	if (ch34x_dev->bulkout_buf)
-		kfree(ch34x_dev->bulkout_buf);
-	if (ch34x_dev->intrin_buf)
-		kfree(ch34x_dev->intrin_buf);
 	ch34x_usb_free_device(ch34x_dev);
 }
 

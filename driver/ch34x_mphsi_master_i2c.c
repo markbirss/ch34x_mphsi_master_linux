@@ -19,8 +19,6 @@
 
 extern int ch34x_usb_transfer(struct ch34x_device *ch34x_dev, int out_len,
 			      int in_len);
-extern int ch34x_usb_transfer_i2c(struct ch34x_device *ch34x_dev,
-				  int out_len, int in_len);
 extern bool ch347_func_switch(struct ch34x_device *ch34x_dev, int index);
 extern int ch34x_mphsi_i2c_probe(struct ch34x_device *ch34x_dev);
 extern void ch34x_mphsi_i2c_remove(struct ch34x_device *ch34x_dev);
@@ -286,8 +284,7 @@ static int ch347_i2c_stream(struct ch34x_device *ch34x_dev, u32 txlen,
 	len = 0;
 
 	if (rxlen) {
-		len = ch34x_usb_transfer_i2c(ch34x_dev, i,
-					     rxlen + ackbits);
+		len = ch34x_usb_transfer(ch34x_dev, i, rxlen + ackbits);
 		if (len != (rxlen + ackbits)) {
 			retval = -EPROTO;
 			goto error;
@@ -304,7 +301,7 @@ static int ch347_i2c_stream(struct ch34x_device *ch34x_dev, u32 txlen,
 			ch34x_dev->bulkin_buf + ackbits, len);
 		memcpy(rxbuf, ch34x_dev->bulkin_buf, rxlen);
 	} else {
-		len = ch34x_usb_transfer_i2c(ch34x_dev, i, ackbits);
+		len = ch34x_usb_transfer(ch34x_dev, i, ackbits);
 		if (len != ackbits) {
 			retval = -EPROTO;
 			goto error;
@@ -498,7 +495,7 @@ int ch34x_mphsi_i2c_probe(struct ch34x_device *ch34x_dev)
 
 	/* Setup I2C adapter description */
 	ch34x_dev->adapter.owner = THIS_MODULE;
-	ch34x_dev->adapter.class = I2C_CLASS_HWMON;
+	ch34x_dev->adapter.class = 0;
 	ch34x_dev->adapter.algo = &ch34x_i2c_algorithm;
 	ch34x_dev->adapter.algo_data = ch34x_dev;
 	ch34x_dev->adapter.dev.parent = &ch34x_dev->intf->dev;
