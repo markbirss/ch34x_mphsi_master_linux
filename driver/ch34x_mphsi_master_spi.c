@@ -15,7 +15,7 @@
 #include "ch34x_mphsi.h"
 
 #define SPI_AUTOPROBE
-#undef SPI_AUTOPROBE
+//#undef SPI_AUTOPROBE
 
 /*
  * SPI_DMA_XFER: SPI high-efficiency transmission switch, but with a 4k packet length limit and xfer->cs_change no longer works when enabled.
